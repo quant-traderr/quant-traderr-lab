@@ -3,7 +3,7 @@
 RMT_Pipeline.py
 ===============
 Project: Quant Trader Lab - RMT Signal Extraction
-Author: @quant.traderr (Instagram)
+Author: [Your/Repo]
 License: MIT
 
 Description:
@@ -113,6 +113,49 @@ def generate_synthetic_data(n_assets):
     
     return matrix, all_evals
 
+# --- MODULE 1.5: RMT LOGIC ---
+
+def apply_rmt_filtering(correlation_matrix, T=252):
+    """
+    Applies Random Matrix Theory (RMT) filtering to the correlation matrix.
+    Uses PCA (Eigen-decomposition) to separate Signal from Noise.
+    """
+    print("[RMT] Applying PCA & Marchenko-Pastur Filtering...")
+    
+    # 1. PCA / Eigen decomposition
+    evals, evecs = np.linalg.eigh(correlation_matrix)
+    
+    # 2. Determine Noise Threshold (Marchenko-Pastur)
+    # Q = T / N (Quality factor)
+    N = correlation_matrix.shape[0]
+    Q = T / N
+    lambda_plus = (1 + np.sqrt(1/Q))**2
+    
+    print(f"      [RMT Setup] N={N}, T={T}, Q={Q:.2f}")
+    print(f"      [Threshold] Max Expected Noise Eigenvalue: {lambda_plus:.4f}")
+    
+    # 3. Filter Eigenvalues
+    # Replace noise eigenvalues (lambda < lambda_plus) with their average
+    noise_indices = evals < lambda_plus
+    if np.any(noise_indices):
+        avg_noise = np.mean(evals[noise_indices])
+        evals[noise_indices] = avg_noise
+        print(f"      [Filter] Denoised {np.sum(noise_indices)} eigenvalues.")
+    else:
+        print("      [Filter] No noise detected (all evals > bound).")
+        
+    # 4. Reconstruct Matrix
+    # Cleaned = V * Lambda_clean * V^T
+    cleaned_matrix = evecs @ np.diag(evals) @ evecs.T
+    
+    # 5. Restore Correlation Properties (Diag=1)
+    np.fill_diagonal(cleaned_matrix, 1.0)
+    
+    # Optional: Fix potential numerical drift causing values > 1 or < -1
+    np.clip(cleaned_matrix, -1.0, 1.0, out=cleaned_matrix)
+    
+    return cleaned_matrix, lambda_plus
+
 # --- MODULE 2: RENDER CAMERA LOGIC ---
 
 def get_camera_path(t, n_assets, peak_pos):
@@ -199,16 +242,16 @@ def get_camera_path(t, n_assets, peak_pos):
 
 # --- MODULE 3: RENDER ENGINE ---
 
-def render_animation(matrix):
+def render_animation(raw_matrix, cleaned_matrix, lambda_plus):
     """Main rendering loop using PyVista."""
     print("[Render] Initializing GPU Engine...")
     
     # 1. Setup
-    n_size = matrix.shape[0]
+    n_size = raw_matrix.shape[0]
     
-    # Find Peak for camera target
-    max_idx = np.unravel_index(np.argmax(matrix), matrix.shape)
-    peak_pos = np.array([max_idx[0], max_idx[1], matrix[max_idx]])
+    # Find Peak for camera target (use cleaned for final focus)
+    max_idx = np.unravel_index(np.argmax(cleaned_matrix - np.eye(n_size)), cleaned_matrix.shape) # Exclude diagonal
+    peak_pos = np.array([max_idx[0], max_idx[1], cleaned_matrix[max_idx]])
     
     # Grid
     x = np.arange(n_size)
@@ -228,9 +271,16 @@ def render_animation(matrix):
     plotter.enable_eye_dome_lighting() # Crucial for "Cyberpunk" look
     plotter.add_light(pv.Light(position=(60,60,80), color='white', intensity=1.1))
 
+    # Calculate ranges for Z-scaling (Visual only)
+    # Scale matrices for better 3D pop (Correlation 0-1 isn't very tall)
+    Z_SCALE = 10.0
+    raw_z = raw_matrix * Z_SCALE
+    clean_z = cleaned_matrix * Z_SCALE
+    
     # Meshes
-    grid = pv.StructuredGrid(gx, gy, matrix)
-    grid["z_height"] = matrix.ravel(order='F') # Scalar for coloring
+    # We will initialize with Raw Data
+    grid = pv.StructuredGrid(gx, gy, raw_z)
+    grid["z_height"] = raw_z.ravel(order='F') 
     
     floor = pv.Plane(center=(n_size/2, n_size/2, 0), direction=(0,0,1), 
                      i_size=n_size*1.2, j_size=n_size*1.2)
@@ -240,7 +290,7 @@ def render_animation(matrix):
         shutil.rmtree(CONFIG["TEMP_DIR"])
     os.makedirs(CONFIG["TEMP_DIR"])
     
-    total_frames = CONFIG["FPS"] * CONFIG["DURATION_SEC"]
+    total_frames = int(CONFIG["FPS"] * CONFIG["DURATION_SEC"])
     print(f"[Render] Starting Render ({total_frames} frames)...")
     
     for i in range(total_frames):
@@ -250,40 +300,43 @@ def render_animation(matrix):
         # 1. Draw Static Elements
         plotter.add_mesh(floor, style='wireframe', color=THEME["FLOOR"], opacity=0.6)
         
-        # 2. Logic: Signal Scanning
-        # From t=9s to t=14s, scan threshold moves down
-        scan_z = -100
-        lambda_plus = 1.35 # Marchenko-Pastur Threshold
+        # 2. Logic: Signal Scanning & RMT Interpolation
+        # From t=9s to t=14s, interpolate from Raw -> Cleaned
+        
+        current_data = raw_z.copy()
+        scan_progress = 0.0
         
         if 9 <= t < 14:
-            p_scan = (t - 9) / 5.0
-            scan_z = matrix.max() - (matrix.max() - lambda_plus) * p_scan
+            scan_progress = (t - 9) / 5.0
+            # Interpolate values
+            current_data = (1 - scan_progress) * raw_z + scan_progress * clean_z
         elif t >= 14:
-            scan_z = lambda_plus
+            current_data = clean_z
+            scan_progress = 1.0
             
-        # Draw Ghost (Noise)
-        if scan_z > matrix.min():
-            ghost = grid.threshold([-100, scan_z], scalars="z_height")
-            if ghost.n_points > 0:
-                plotter.add_mesh(ghost, style='wireframe', color='grey', opacity=0.1, show_scalar_bar=False)
+        # Update Grid Geometry
+        grid.points[:, 2] = current_data.ravel(order='F')
+        grid["z_height"] = current_data.ravel(order='F')
         
-        # Draw Solid (Signal)
-        if scan_z < matrix.max():
-            solid = grid.threshold([scan_z, 100], scalars="z_height")
-            if solid.n_points > 0:
-                plotter.add_mesh(solid, scalars="z_height", cmap=THEME["MESH_CMAP"], 
-                                 opacity=0.9, show_scalar_bar=False)
-                # Wireframe overlay
-                plotter.add_mesh(solid, style='wireframe', color='white', opacity=0.35)
+        # Draw Mesh
+        # Threshold for visual clarity?
+        # Just draw full mesh with opacity mapping
+        plotter.add_mesh(grid, scalars="z_height", cmap=THEME["MESH_CMAP"], 
+                         opacity=0.9, show_scalar_bar=False)
+        
+        # Wireframe overlay
+        plotter.add_mesh(grid, style='wireframe', color='white', opacity=0.2)
 
-        # Draw Laser Plane
+        # Draw Laser Plane (The "Cleaning" Beam)
         if 9 <= t < 14:
-            plane = pv.Plane(center=(n_size/2, n_size/2, scan_z), i_size=n_size*1.5, j_size=n_size*1.5)
-            plotter.add_mesh(plane, color=THEME["SCANNER"], opacity=0.15)
+            scan_x = n_size * scan_progress
+            plane = pv.Plane(center=(scan_x, n_size/2, 5), direction=(1,0,0), 
+                             i_size=15, j_size=n_size)
+            plotter.add_mesh(plane, color=THEME["SCANNER"], opacity=0.3)
             
         # 3. UI
         if t >= 13.0:
-             plotter.add_point_labels([peak_pos], ["ALPHA DETECTED\n[sig > 1.35]"],
+             plotter.add_point_labels([peak_pos], ["ALPHA DETECTED\n[Noise Filtered]"],
                                       font_size=24, text_color=THEME["TEXT"], font_family='courier',
                                       shape_opacity=0, shadow=True)
 
@@ -298,7 +351,7 @@ def render_animation(matrix):
         plotter.screenshot(os.path.join(CONFIG["TEMP_DIR"], f"frame_{i:04d}.png"))
         
         if i % 100 == 0:
-            print(f"      Rendered {i}/{total_frames}")
+            print(f"      Rendered {i}/{total_frames} | Mode: {'RAW' if t<9 else 'RMT OK' if t>=14 else 'CLEANING'}")
 
     plotter.close()
     print("[Render] Rendering Complete.")
@@ -357,11 +410,14 @@ def main():
         
     if matrix is None:
         matrix, _ = generate_synthetic_data(CONFIG["N_ASSETS"])
-        
-    # 2. Render
-    render_animation(matrix)
     
-    # 3. Compile
+    # 2. RMT Processing
+    cleaned_matrix, lambda_plus = apply_rmt_filtering(matrix)
+        
+    # 3. Render
+    render_animation(matrix, cleaned_matrix, lambda_plus)
+    
+    # 4. Compile
     compile_final_video()
     
     print("=== PIPELINE FINISHED SUCCESSFULY ===")
