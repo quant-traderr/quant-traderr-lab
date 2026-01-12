@@ -3,7 +3,7 @@
 RMT_Pipeline.py
 ===============
 Project: Quant Trader Lab - RMT Signal Extraction
-Author: [Your/Repo]
+Author: @quant.traderr (Instagram)
 License: MIT
 
 Description:
