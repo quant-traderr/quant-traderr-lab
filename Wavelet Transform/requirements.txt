@@ -1,0 +1,7 @@
+ numpy 
+ pandas
+ yfinance
+ scipy 
+ matplotlib
+ pywavelets 
+ moviepy
