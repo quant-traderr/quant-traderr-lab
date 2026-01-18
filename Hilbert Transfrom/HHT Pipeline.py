@@ -2,14 +2,13 @@
 HHT_Pipeline.py
 ===============
 Project: Quant Trader Lab - HHT Video Generation
-Author: quant.traderr (Instagram)
+Author: Open Source Quant
 License: MIT
 
 Description:
     A production-ready pipeline for visualizing the Hilbert-Huang Transform (HHT) 
     of financial time series. It decomposes the signal into Intrinsic Mode Functions (IMFs)
-    and visualizes the Trend, Noise, and Residual components in a Bloomberg-styled 
-    animation.
+    and visualizes the Trend, Noise, and Residual components in a animation.
 
     Pipeline Steps:
     1.  **Data Acquisition**: Fetches historical data via `yfinance`.
@@ -38,6 +37,7 @@ import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 from multiprocessing import Pool, cpu_count
 from datetime import datetime
+from typing import Tuple, Dict, Optional, Any
 
 # EMD Library Handling
 try:
@@ -55,8 +55,12 @@ try:
     from moviepy import ImageSequenceClip, ImageClip, CompositeVideoClip
     MOVIEPY_V2 = True
 except ImportError:
-    from moviepy.editor import ImageSequenceClip, ImageClip, CompositeVideoClip
-    MOVIEPY_V2 = False
+    try:
+        from moviepy.editor import ImageSequenceClip, ImageClip, CompositeVideoClip
+        MOVIEPY_V2 = False
+    except ImportError:
+        MOVIEPY_V2 = False
+        print("Warning: MoviePy not found.")
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -87,7 +91,7 @@ THEME = {
 
 # --- UTILS ---
 
-def log(msg):
+def log(msg: str) -> None:
     """Centralized logger."""
     timestamp = time.strftime("%H:%M:%S")
     formatted_msg = f"[{timestamp}] {msg}"
@@ -100,10 +104,74 @@ def log(msg):
 
 # --- MODULE 1: DATA ---
 
-def fetch_and_process_data():
+def perform_hht_decomposition(data: np.ndarray) -> Tuple[Optional[Dict[str, np.ndarray]], Optional[np.ndarray]]:
     """
-    Fetches market data and performs EMD decomposition.
-    Returns: prices (Series), imfs (ndarray), components (dict)
+    Core HHT logic: Decomposes a 1D array into Noise, Trend, and Residual components.
+    
+    Args:
+        data (np.ndarray): 1D array of price data.
+        
+    Returns:
+        tuple: (components dict, imfs array) or (None, None) on failure.
+    """
+    try:
+        # Perform EMD
+        imfs = None
+        
+        # log is not directly accessible if called from worker in some contexts, 
+        # but we'll assume standard imports or pass logic. 
+        # For simplicity in this helper, we won't log info unless error.
+        
+        if EMD_LIB == 'emd':
+            imf = emd.sift.sift(data)
+            imfs = imf.T # (num_imfs, N)
+        elif EMD_LIB == 'PyEMD':
+            e = EMD()
+            imfs = e.emd(data) # (num_imfs, N)
+        else:
+            # Fallback MA decomposition
+            series = pd.Series(data)
+            ema10 = series.ewm(span=10).mean().values
+            ema50 = series.ewm(span=50).mean().values
+            imf0 = data - ema10 # Noise
+            imf1 = ema10 - ema50 # Cyclical
+            imf2 = ema50 # Trend
+            imfs = np.vstack([imf0, imf1, imf2])
+
+        # Decompose into components
+        num_imfs = imfs.shape[0]
+        
+        # Noise: First 2 IMFs
+        if num_imfs >= 2:
+            noise = np.sum(imfs[:2], axis=0)
+        else:
+            noise = imfs[0]
+            
+        # Trend: Remainder (imf 2 onwards)
+        split_idx = 2
+        if num_imfs > split_idx:
+            trend = np.sum(imfs[split_idx:], axis=0)
+        else:
+            trend = imfs[-1]
+            
+        components = {
+            "noise": noise,
+            "trend": trend,
+            "residual": trend 
+        }
+        return components, imfs
+        
+    except Exception as e:
+        # In worker, this might print to stderr
+        print(f"[Decomp Error] {e}")
+        return None, None
+
+def fetch_and_process_data() -> Tuple[Optional[pd.Series], Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]:
+    """
+    Fetches market data and performs GLOBAL EMD decomposition (for axis limits).
+    
+    Returns:
+        tuple: (prices Series, imfs ndarray, components dict) or (None, None, None) on failure.
     """
     asset = CONFIG["ASSET"]
     start_date = CONFIG["START_DATE"]
@@ -142,53 +210,15 @@ def fetch_and_process_data():
             log(f"[Error] Not enough data points ({len(price_series)}).")
             return None, None, None
 
-        # Perform EMD
+        # Perform GLOBAL EMD for Limits
+        log(f"[Math] Performing Global EMD using {EMD_LIB} (for limits)...")
         data = price_series.values
-        imfs = None
+        components, imfs = perform_hht_decomposition(data)
         
-        log(f"[Math] Performing EMD using {EMD_LIB}...")
+        if components is None:
+            return None, None, None
         
-        if EMD_LIB == 'emd':
-            imf = emd.sift.sift(data)
-            imfs = imf.T # emd returns (N, num_imfs) -> Transpose to (num_imfs, N) for consistency
-        elif EMD_LIB == 'PyEMD':
-            e = EMD()
-            imfs = e.emd(data) # PyEMD returns (num_imfs, N)
-        else:
-            log("[Warning] No EMD library found. Using fallback MA decomposition.")
-            # Fallback
-            series = pd.Series(data)
-            ema10 = series.ewm(span=10).mean().values
-            ema50 = series.ewm(span=50).mean().values
-            imf0 = data - ema10 # Noise
-            imf1 = ema10 - ema50 # Cyclical
-            imf2 = ema50 # Trend
-            imfs = np.vstack([imf0, imf1, imf2])
-
-        # Decompose into components
-        # Logic from original visualizer
-        num_imfs = imfs.shape[0]
-        
-        # Noise: First 2 IMFs or just first
-        if num_imfs >= 2:
-            noise = np.sum(imfs[:2], axis=0)
-        else:
-            noise = imfs[0]
-            
-        # Trend: Remainder
-        split_idx = 2
-        if num_imfs > split_idx:
-            trend = np.sum(imfs[split_idx:], axis=0)
-        else:
-            trend = imfs[-1]
-            
-        components = {
-            "noise": noise,
-            "trend": trend,
-            "residual": trend # In original logic, residual and trend were treated similarly for plotting
-        }
-        
-        log(f"[Data] Processed {len(price_series)} points. IMFs: {num_imfs}")
+        log(f"[Data] Processed {len(price_series)} points. Global IMFs: {imfs.shape[0]}")
         return price_series, imfs, components
 
     except Exception as e:
@@ -199,19 +229,37 @@ def fetch_and_process_data():
 
 # --- MODULE 2: RENDERING ---
 
-def render_worker(args):
+def render_worker(args: Tuple) -> bool:
     """
     Parallel worker to render a single Matplotlib frame.
-    args: (frame_idx, cut_idx, prices, components, dates, config, theme, axis_limits)
+    
+    Args:
+        args (tuple): Unpacked as (frame_idx, cut_idx, prices, components, dates, config, theme, axis_limits).
+        
+    Returns:
+        bool: True on success, False on failure.
     """
     frame_idx, i, prices, comps, dates, cfg, theme, limits = args
     
     try:
-        # Slice Data
+        # Slice Data (Expanding Window)
         curr_dates = dates[:i]
         curr_price = prices.iloc[:i]
-        curr_trend = comps['trend'][:i]
-        curr_noise = comps['noise'][:i]
+        
+        # Perform Local Decomposition
+        # We need an array for EMD
+        curr_data = curr_price.values
+        
+        # Optimization: EMD is slow. For very short series, it might be unstable.
+        # But our start index is 50, which should be fine.
+        local_comps, _ = perform_hht_decomposition(curr_data)
+        
+        if local_comps is None:
+            # Fallback (shouldn't happen often if data is clean)
+            return False
+            
+        curr_trend = local_comps['trend']
+        curr_noise = local_comps['noise']
         
         # Setup Figure
         plt.style.use('dark_background')
@@ -288,9 +336,16 @@ def render_worker(args):
         print(f"Error rendering frame {frame_idx}: {e}")
         return False
 
-def run_render_manager(prices, components):
+def run_render_manager(prices: pd.Series, components: Dict[str, np.ndarray]) -> bool:
     """
-    Manages parallel rendering.
+    Manages parallel rendering of video frames.
+    
+    Args:
+        prices (pd.Series): The full price history.
+        components (dict): Dictionary of global component arrays (used for axis scaling).
+        
+    Returns:
+        bool: True if rendering completed successfully.
     """
     n_samples = len(prices)
     dates = prices.index
@@ -359,8 +414,8 @@ def run_render_manager(prices, components):
 
 # --- MODULE 3: COMPILATION ---
 
-def compile_video():
-    """Compiles frames into MP4 using MoviePy."""
+def compile_video() -> None:
+    """Compiles generated frames into a high-quality MP4 video using MoviePy."""
     log("[Compile] Assembling Video...")
     
     frames = sorted([
