@@ -4,7 +4,7 @@
 
 🚀 **Current Focus:**
 - Identifying market alpha using **Econophysics** (RMT, PSR).
-- Building execution algorithms for **Indian Markets (NSE)**.
+- Building execution algorithms for **Indian Markets (NSE) & Global Markets.**.
 - Documenting the journey on [Instagram (@quant.traderr)](https://instagram.com/quant.traderr).
 - 
 📫 **Contact:**
