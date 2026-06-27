@@ -8,4 +8,5 @@
 - Documenting the journey on [Instagram (@quant.traderr)](https://instagram.com/quant.traderr).
 - 
 📫 **Contact:**
-- Instagram @quant.traderr
+- Instagram @quant.dhawan
+- Mail : Team@thuztra.com
